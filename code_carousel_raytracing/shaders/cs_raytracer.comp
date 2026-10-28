@@ -1,0 +1,592 @@
+
+
+layout (local_size_x = 4, local_size_y = 4, local_size_z = 1) in;
+layout(rgba32f, binding = 0) uniform image2D imgOutput;
+
+uniform mat4 uProjInv;
+uniform mat4 uViewInv;
+uniform mat4 uModelInv;
+uniform vec3 uLDir;
+
+uniform vec4 terrain_rect;
+uniform int n_trees;
+uniform int n_lamps;
+uniform int n_cars;
+uniform int n_cameramen;
+
+// per il texture mapping
+uniform sampler2D TerrainTexture;
+uniform vec2 TerrainTiling;
+
+PhongMaterial default_material;
+
+struct stick_object {
+    vec3  pos;
+    float height; 
+};
+
+layout(std430, binding = 0) buffer trees_data {
+    stick_object trees[];
+};
+
+layout(std430, binding = 1) buffer lamps_data {
+    stick_object lamps[];
+};
+
+layout(std430, binding = 2) buffer cars_data {
+    mat4 cars[];
+};
+
+layout(std430, binding = 3) buffer cameramen_data {
+    mat4 cameramen[];
+};
+
+mat3 create_axes(in vec3 x_axis, in vec3 norm){
+    mat3 axes;
+    axes[0] = normalize(x_axis);
+    vec3 y_axis = normalize(cross(norm,axes[0]));
+    vec3 z_axis = normalize(cross(axes[0],y_axis));
+
+    axes[1] = y_axis;
+    axes[2] = z_axis;
+    axes = transpose(axes);
+    return axes;
+}
+
+struct Ray {
+    vec3 orig;
+    vec3 dir;
+};
+
+struct Sphere {
+    vec3 center;
+    float radius;
+    PhongMaterial material; 
+};
+
+struct Quad{
+    mat3 axes;
+    vec3 pos;
+    vec2 size;
+    PhongMaterial material; 
+};
+
+struct Cylinder{
+    vec3 center;
+    float radius;
+    float height;
+    PhongMaterial material;
+};
+
+struct Cube{
+    vec3 center;
+    vec3 size;
+    PhongMaterial material;
+};
+
+Quad terrain;
+
+struct HitInfo {
+    float t;
+    vec3 p;
+    vec3 n;
+    vec2 uv;
+    PhongMaterial m;
+    bool hit;
+};
+
+// Initialize a default HitInfo struct
+HitInfo defaultHitInfo() {
+    HitInfo h;
+    h.t = 1e30; // A large number to represent no hit
+    h.hit = false;
+    return h;
+}
+
+Ray toLocal(Ray r, mat4 frame){ //moltiplico il raggio per l'inversa del frame dell'oggetto per avere le sue coordinate e direzione in spazio oggetto
+    Ray localRay;
+    mat4 invFrame = inverse(frame);
+    localRay.orig = vec3(invFrame * vec4(r.orig.x, r.orig.y, r.orig.z, 1.0));
+    localRay.dir = normalize(mat3(invFrame) * r.dir);
+    return localRay;
+}
+
+void toWorld(inout HitInfo h, mat4 frame){ //moltiplico i dati di hitinfo in spazio oggetto con il frame per iportarli in spazio mondo
+    h.p = vec3(frame * vec4(h.p.x, h.p.y, h.p.z, 1.0));
+    h.n = normalize(mat3(frame) * h.n);
+}
+
+bool hit_sphere(Ray r, Sphere s, out HitInfo nfo) {
+	float A = dot(r.dir, r.dir);
+	float B = dot(r.dir, r.orig - s.center) * 2.0;
+	float C = dot(r.orig - s.center, r.orig - s.center) - s.radius * s.radius;
+
+	float delta = B * B - 4.0 * A * C;
+
+	if (delta < 0.0)
+		return false;
+
+	float t1 = (-B - sqrt(delta)) / (2.0 * A);
+    float t2 = (-B + sqrt(delta)) / (2.0 * A);
+
+    float t_min = min(t1, t2);
+    float t_max = max(t1, t2);
+
+    // Per impedire che vengano renderizzate le sfere dietro la camera
+    if (t_max < 0.0) return false;
+	if (t_min < 0.0) t_min = t_max;
+
+    vec3 p = r.orig + r.dir * t_min;
+    vec3 n = normalize(p - s.center);
+
+	nfo.t = t_min;
+	nfo.p = p;
+	nfo.n = n;
+	nfo.m = s.material;
+	nfo.hit = (t_min > 0.0);
+
+	return true;
+}
+
+bool hit_cylinder(Ray r, Cylinder c, out HitInfo nfo)
+{
+    vec3 d = r.orig - c.center;
+    float A = r.dir.x * r.dir.x + r.dir.z * r.dir.z;
+    float B = 2.0 * (d.x * r.dir.x + d.z * r.dir.z);
+    float C = d.x * d.x + d.z * d.z - c.radius * c.radius;
+
+    float delta = B * B - 4.0 * A * C;
+    if (delta < 0.0) return false;
+
+    float t1 = (-B - sqrt(delta)) / (2.0 * A);
+    float t2 = (-B + sqrt(delta)) / (2.0 * A);
+
+    float t_min = min(t1, t2);
+    float t_max = max(t1, t2);
+
+    if (t_max < 0.0) return false;
+	if (t_min < 0.0) t_min = t_max;
+
+    float y = d.y + t_min * r.dir.y;
+    if (y < -c.height / 2 || y >  c.height / 2)
+    {
+        y = d.y + t_max * r.dir.y;
+        if (y < -c.height / 2 || y >  c.height / 2) return false;
+        t_min=t_max;
+    }
+
+    nfo.t = t_min;
+    nfo.p = r.orig + t_min * r.dir;
+    nfo.n = normalize(vec3(nfo.p.x - c.center.x, 0.0, nfo.p.z - c.center.z));
+    nfo.uv = vec2(0.0);
+    nfo.m = c.material;
+    nfo.hit = true;
+
+    return true;
+}
+
+bool hit_cube(Ray r, Cube b, out HitInfo nfo)
+{
+    vec3 bmin = b.center - b.size / 2;
+    vec3 bmax = b.center + b.size / 2;
+    vec3 invDir = 1.0 / r.dir;
+    vec3 t0 = (bmin - r.orig) * invDir;
+    vec3 t1 = (bmax - r.orig) * invDir;
+    vec3 tMinVec = min(t0, t1);
+    vec3 tMaxVec = max(t0, t1);
+    float t_min = max(max(tMinVec.x, tMinVec.y), tMinVec.z);
+    float t_max= min(min(tMaxVec.x, tMaxVec.y), tMaxVec.z);
+
+    if (t_max < 0.0 || t_min > t_max) return false;
+    if (t_min <= 0.0) t_min = t_max;
+
+    nfo.t = t_min;
+    nfo.p = r.orig + t_min * r.dir;
+    nfo.m = b.material;
+    nfo.hit = true;
+    nfo.uv = vec2(0.0);
+
+    vec3 p = nfo.p;
+    float eps = 0.0001;
+
+    //per capire su quale faccia ha colpito il raggio
+    if (abs(p.x - bmin.x) < eps) nfo.n = vec3(-1,0,0);
+    else if (abs(p.x - bmax.x) < eps) nfo.n = vec3(1,0,0);
+    else if (abs(p.y - bmin.y) < eps) nfo.n = vec3(0,-1,0);
+    else if (abs(p.y - bmax.y) < eps) nfo.n = vec3(0,1,0);
+    else if (abs(p.z - bmin.z) < eps) nfo.n = vec3(0,0,-1);
+    else
+        nfo.n = vec3(0,0,1);
+
+    return true;
+}
+
+bool hit_quad( Ray r,  Quad q, out HitInfo nfo){
+    
+    nfo.hit = false;
+
+    vec3 pos_frame  = (q.axes * r.orig - q.axes*q.pos);
+    vec3 dir_frame = q.axes * r.dir; 
+    
+    if( abs(dir_frame.z) < 0.001)
+        return false;
+    
+    float t = - pos_frame.z / dir_frame.z;
+    
+    if(t < 0.0) return false;
+
+    vec3 intPoint = vec3(pos_frame.x+t*dir_frame.x,pos_frame.y+t*dir_frame.y,0.0);
+    if(intPoint.x < -q.size.x/2.0) return false;
+    if(intPoint.y < -q.size.y/2.0) return false;
+    if(intPoint.x >  q.size.x/2.0) return false;
+    if(intPoint.y >  q.size.y/2.0) return false;
+       
+    mat3 axesT = transpose(q.axes);
+    nfo.p = r.orig+t*r.dir;
+    nfo.n = normalize(axesT[2]);
+    if (dot(nfo.n, r.dir) > 0.0) nfo.n = -nfo.n; //sennò si vede la luce pure nel lato opposto alla luce direzionale
+    nfo.m = q.material;
+    nfo.t = t;
+    nfo.hit = true;
+
+    //per calcolare le coordinate uv della texture sul quad
+    nfo.uv = vec2((nfo.p.x - terrain_rect.x) / terrain_rect.z, (nfo.p.z - terrain_rect.y) / terrain_rect.w);
+    
+    nfo.m.diffuse_color = vec3(1,0,0);
+    nfo.m.specular_color = vec3(0);
+    
+
+    return true;
+}
+
+HitInfo closest(in HitInfo nfo1,in HitInfo nfo2){
+    if(nfo1.t < nfo2.t) return nfo1; else return nfo2;
+}
+
+HitInfo hit_scene(  Ray r,   float m, float M, bool sr){
+ HitInfo nfoT;
+ nfoT.hit = false;
+ nfoT.t = M;
+ r.orig += m*r.dir;
+
+// test all the elements of the scene
+/*
+    Note: in this stub implementation  all the elements are represented with spheres and are
+    created online with the constructor.
+*/
+ HitInfo cnfo;
+ PhongMaterial mt = default_material;
+// Alberi
+for (int i = 0; i < n_trees; ++i){
+
+    // Tronco
+    PhongMaterial trunkMaterial = default_material;
+    trunkMaterial.diffuse_color = vec3(0.4, 0.2, 0.1);
+    trunkMaterial.ambient_color = vec3(0.2, 0.1, 0.05);
+
+    float trunkHeight = trees[i].height * 0.5;
+    float trunkRadius = trees[i].height * 0.2;
+    vec3 trunkCenter = trees[i].pos + vec3(0.0, trunkHeight * 0.5, 0.0);
+    Cylinder trunk = Cylinder(trunkCenter, trunkRadius, trunkHeight, trunkMaterial);
+
+    if (hit_cylinder(r, trunk, cnfo))
+    {
+        nfoT = closest(cnfo, nfoT);
+    }
+
+    // Foglie
+    PhongMaterial leavesMaterial = default_material;
+    leavesMaterial.diffuse_color = vec3(0.0, 0.7, 0.0);
+    leavesMaterial.ambient_color = vec3(0.0, 0.1, 0.0);
+
+    float leavesRadius = trees[i].height * 0.7;
+    vec3 leavesCenter = trees[i].pos + vec3(0.0, trunkHeight + leavesRadius - 0.05, 0.0);
+    Sphere leaves = Sphere(leavesCenter, leavesRadius, leavesMaterial);
+
+    if (hit_sphere(r, leaves, cnfo))
+    {
+        nfoT = closest(cnfo, nfoT);
+    }
+}
+
+// Lampioni
+for (int i = 0; i < n_lamps; ++i){
+
+    // Palo
+    PhongMaterial poleMaterial = default_material;
+    poleMaterial.diffuse_color = vec3(0.4, 0.4, 0.4);
+    poleMaterial.ambient_color = vec3(0.1, 0.1, 0.1);
+
+    float poleHeight = lamps[i].height * 1.5;
+    float poleRadius = lamps[i].height * 0.05;
+    vec3 poleCenter = lamps[i].pos + vec3(0.0, poleHeight * 0.5, 0.0);
+    Cylinder pole = Cylinder(poleCenter, poleRadius, poleHeight, poleMaterial);
+
+    if (hit_cylinder(r, pole, cnfo))
+    {
+        nfoT = closest(cnfo, nfoT);
+    }
+
+    // Lampada
+    PhongMaterial lampMaterial = default_material;
+    lampMaterial.diffuse_color = vec3(1.0, 0.8, 0.5);
+    lampMaterial.ambient_color = vec3(1.0, 0.8, 0.5);
+    lampMaterial.emissive_color = vec3(2.0, 2.0, 0.5);
+
+    float lampRadius = lamps[i].height * 0.2;
+    vec3 lampCenter = lamps[i].pos + vec3(0.0, poleHeight + lampRadius - 0.05, 0.0);
+    Sphere lamp = Sphere(lampCenter, lampRadius, lampMaterial);
+
+    if (hit_sphere(r, lamp, cnfo))
+    {
+        nfoT = closest(cnfo, nfoT);
+    }
+}
+
+// Macchine
+for (int i = 0; i < n_cars; ++i){
+
+    // trasformo il ray nel sistema locale dell'auto
+    Ray carRay = toLocal(r, cars[i]);
+
+    // Corpo
+    PhongMaterial carMaterial = default_material;
+    carMaterial.diffuse_color = vec3(0.1, 0.2, 0.6);
+    carMaterial.ambient_color = vec3(0.0, 0.0, 0.4);
+    carMaterial.specular_color = vec3(0.5, 0.5, 0.5);
+    carMaterial.shininess = 50;
+
+    Cube body = Cube(vec3(0.0, 0.5, 0.0), vec3(1.5, 0.9, 2.4), carMaterial);
+    if (hit_cube(carRay, body, cnfo))
+    {
+        toWorld(cnfo, cars[i]);
+        nfoT = closest(cnfo, nfoT);
+    }
+
+    // Materiale fari
+    PhongMaterial carLMaterial = default_material;
+    carLMaterial.diffuse_color = vec3(1.0, 0.8, 0.5);
+    carLMaterial.ambient_color = vec3(1.0, 0.8, 0.5);
+    carLMaterial.emissive_color = vec3(2.0, 2.0, 0.5);
+
+    // Faro sinistro
+    Cube carL1 = Cube(vec3(-0.4, 0.35, -1.22), vec3(0.3, 0.2, 0.08), carLMaterial);
+    if (hit_cube(carRay, carL1, cnfo))
+    {
+        toWorld(cnfo, cars[i]);
+        nfoT = closest(cnfo, nfoT);
+    }
+
+    // Faro destro
+    Cube carL2 = Cube(vec3(0.4, 0.35, -1.22), vec3(0.3, 0.2, 0.08), carLMaterial);
+    if (hit_cube(carRay, carL2, cnfo))
+    {
+        toWorld(cnfo, cars[i]);
+        nfoT = closest(cnfo, nfoT);
+    }
+}
+
+ // Cameramen
+for (int i = 0; i < n_cameramen; ++i){
+
+    Ray cameramanRay = toLocal(r, cameramen[i]);
+
+    // Palo
+    PhongMaterial poleCMaterial = default_material;
+    poleCMaterial.diffuse_color = vec3(0.2, 0.2, 0.2);
+    poleCMaterial.ambient_color = vec3(0.1, 0.1, 0.1);
+
+    Cube body = Cube(vec3(0.0, 0.75, 0.0), vec3(0.3, 1.5, 0.3), poleCMaterial);
+    if (hit_cube(cameramanRay, body, cnfo))
+    {
+        toWorld(cnfo, cameramen[i]);
+        nfoT = closest(cnfo, nfoT);
+    }
+
+    // Videocamera
+    PhongMaterial cameraMaterial = default_material;
+    cameraMaterial.diffuse_color = vec3(0.1, 0.1, 0.1);
+    cameraMaterial.ambient_color = vec3(0.01, 0.01, 0.01);
+    cameraMaterial.specular_color = vec3(0.25, 0.25, 0.25);
+    cameraMaterial.shininess = 30;
+
+    Cube camera = Cube(vec3(0.0, 1.5, -0.3), vec3(0.5, 0.5, 1.0), cameraMaterial);
+    if (hit_cube(cameramanRay, camera, cnfo))
+    {
+        toWorld(cnfo, cameramen[i]);
+        nfoT = closest(cnfo, nfoT);
+    }
+}
+
+// Pavimento
+if ( hit_quad( r, terrain, cnfo)  ){
+    vec2 tiledUV = cnfo.uv * TerrainTiling;
+    vec2 tile = floor(tiledUV);
+    vec2 localUV = fract(tiledUV);
+
+    if (mod(tile.x, 2) == 1) localUV.x = 1 - localUV.x;
+    if (mod(tile.y, 2) == 1) localUV.y = 1 - localUV.y;
+    vec3 texColor = texture(TerrainTexture, localUV).rgb;
+
+    cnfo.m.diffuse_color = texColor;
+    cnfo.m.ambient_color = texColor * 0.7 ;
+    nfoT = closest(cnfo,nfoT); 
+ }
+
+ nfoT.hit =  (nfoT.t < M); 
+ return nfoT;
+}
+
+// Capisce se un punto è in ombra tramite gli shadowray
+bool inShadow(in HitInfo hi, in vec3 lightDirection, in float maxDistance)
+{
+    Ray shadowRay;
+    HitInfo shadowHit;
+
+    shadowRay.orig = hi.p + hi.n * 0.003;
+    shadowRay.dir = normalize(lightDirection);
+    shadowHit = hit_scene(shadowRay, 0.0, maxDistance, true);
+
+    return shadowHit.hit;
+}
+
+vec3 spotlightPhong(Ray r, HitInfo hi, vec3 lightPosition, vec3 lightDirection)
+{
+    vec3 lightColor = vec3(1.0, 0.9, 0.8);
+    float intensity = 0.9;
+    float maxRange = 20.0;
+    vec3 N = normalize(hi.n);
+    float distanceToPoint = length(hi.p - lightPosition);
+    float attenuation = pow(max(1.0 - distanceToPoint / maxRange, 0.0), 2.0); //attenuazione rispetto alla distanza
+    if (distanceToPoint >= maxRange) return vec3(0.0, 0.0, 0.0); //range massimo della luce
+
+    vec3 directionToPoint = (hi.p - lightPosition) / distanceToPoint;
+    float coneFactor = smoothstep(cos(radians(30.0)), cos(radians(20.0)), dot(normalize(lightDirection), directionToPoint));
+    if (coneFactor <= 0.0) return vec3(0.0);
+
+    vec3 L = -directionToPoint;
+    vec3 V = normalize(-r.dir);
+
+    if (inShadow(hi, lightPosition - hi.p, distanceToPoint - 0.01)) return vec3(0.0, 0.0, 0.0); //la luce viene bloccata
+
+    vec3 c = phong(L, V, N, hi.m, lightColor * intensity);
+
+    return c * coneFactor * attenuation;
+}
+
+vec3 bulbLightPhong(Ray r, HitInfo hi, vec3 bulbCenter, float bulbRadius)
+{
+    vec3 lightColor = vec3(1.0, 0.9, 0.8);
+    float intensity = 0.6;
+    float maxRange = 10.0;
+    vec3 N = normalize(hi.n);
+
+    vec3 bulbN = normalize(hi.p - bulbCenter);
+    vec3 lightPosition = bulbCenter + bulbN * bulbRadius;
+    float distanceToPoint = length(hi.p - lightPosition);
+    float attenuation = pow(max(1.0 - distanceToPoint / maxRange, 0.0), 2.0);
+    if (distanceToPoint >= maxRange) return vec3(0.0, 0.0, 0.0);
+
+    vec3 L = normalize(lightPosition - hi.p);
+    vec3 V = normalize(-r.dir);
+
+    if (inShadow(hi, lightPosition - hi.p, distanceToPoint - 0.003)) return vec3(0.0, 0.0, 0.0);
+
+    vec3 c = phong(L, V, N, hi.m, lightColor * intensity);
+
+    return c * attenuation;
+}
+
+vec3 getColor(Ray r, HitInfo hi, vec3 l_dir) // Decide che colore usare in base alle circostanze
+{
+    vec3 c = phong(l_dir, -r.dir, hi.n, hi.m, uLightColor);
+    if (hi.m.emissive_color != vec3(0.0)) return hi.m.emissive_color; //per evitare ombre sugli oggetti emissivi
+    if (inShadow(hi, l_dir, 1000.0)) c = hi.m.ambient_color;
+
+    // Luce fari
+    for (int i = 0; i < n_cars; ++i)
+    {
+        vec3 lightPosition1 = vec3(cars[i] * vec4(-0.4, 0.35, -1.3, 1.0));
+        vec3 lightPosition2 = vec3(cars[i] * vec4(0.4, 0.35, -1.3, 1.0));
+        vec3 lightDirection = normalize(vec3(cars[i] * vec4(0.0, 0.0, -1.0, 0.0)));
+
+        c += spotlightPhong(r, hi, lightPosition1, lightDirection);
+        c += spotlightPhong(r, hi, lightPosition2, lightDirection);
+    }
+
+    // Luce lampioni
+    for (int i = 0; i < n_lamps; ++i)
+    {
+        float poleHeight = lamps[i].height * 1.5;
+        float lampRadius = lamps[i].height * 0.2;
+        vec3 lampCenter = lamps[i].pos + vec3(0.0, poleHeight + lampRadius -0.05, 0.0);
+
+        c += bulbLightPhong(r, hi, lampCenter, lampRadius);
+    }
+    return c;
+}
+
+shared vec3 samples[16];
+void main(void) 
+{ 
+
+   default_material = PhongMaterial( uAmbientColor,uDiffuseColor,uSpecularColor,uEmissiveColor,uShininess);
+
+   ivec2 pix = ivec2(gl_GlobalInvocationID.xy/4);
+
+
+   uint id_sample = 4*gl_LocalInvocationID.y+gl_LocalInvocationID.x;
+
+   imageStore(imgOutput, pix, vec4(0.0,0.0,0.0,1.0) );
+
+
+   /* create a quad for the terrain */
+   vec2 sz = terrain_rect.zw+terrain_rect.xy;
+   vec2 center = (terrain_rect.xy + terrain_rect.zw)*0.5;
+   terrain =  Quad(create_axes(vec3(1.0,0.0,0.0),vec3(0.0,1.0,0.0)),vec3(center.x,0.0,center.y),vec2(sz.x,sz.y),default_material);
+
+
+   /* create the ray */
+   Ray r;
+   vec2 rc  =vec2(gl_LocalInvocationID.x/4.0,gl_LocalInvocationID.y/4.0);
+   vec2 rpos = vec2(-1.0) +  2.0 * vec2(pix+rc)/vec2(gl_NumWorkGroups.x,gl_NumWorkGroups.y);
+
+
+  /* bring the ray in world space */  
+   vec4 p0 = uProjInv * vec4(rpos,-1.0,1.0);
+   p0 /= p0.w;
+   vec4 p1 = uProjInv * vec4(rpos, 1.0,1.0);
+   p1 /= p1.w;
+   r.orig = (uModelInv*uViewInv * p0).xyz; 
+   r.dir  = normalize((uModelInv* uViewInv * (p1-p0)).xyz);
+
+   /* bring the light in world space */
+   vec3 l_dir = normalize((uModelInv* vec4(uLDir,1.0)).xyz);
+
+
+   HitInfo hi = hit_scene(r,0.0,1000, false);
+
+   samples[id_sample] = vec3(0.0);
+   if(hi.hit){
+        samples[id_sample] = getColor(r, hi, l_dir);
+   }
+   else{
+        samples[id_sample] = vec3(0.1, 0.2, 0.5);
+   }
+
+    barrier(); // Ensure all threads have written their results before proceeding
+
+    // After barrier, we can safely average the results
+    vec3 finalColor = vec3(0.0);
+    if (gl_LocalInvocationIndex == 0) {
+
+	    for (uint i = 0; i < 16; ++i) {
+		    finalColor += samples[i];
+	    }
+	    finalColor /= 16.0;
+
+	    // Write the averaged color to the output image
+	    imageStore(imgOutput, pix, vec4(finalColor,1.0));
+     }
+
+}
