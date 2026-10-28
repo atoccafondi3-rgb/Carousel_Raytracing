@@ -1,0 +1,4 @@
+# Temporary files
+/code_carousel_raytracing/out
+/code_carousel_raytracing/.vs
+/code_carousel_raytracing/imgui.ini
