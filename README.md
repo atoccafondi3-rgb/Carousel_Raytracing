@@ -9,7 +9,7 @@ You can change the camera with the Menu on the top left of the UI. The options a
 
 -the trackball camera
 
--any of the cameramen around the scene, which are numbered clockwise (camera 1 is on top right, camera 2 is bottom right ecc.)
+-any of the cameramen around the scene
 
 
 free camera controls:
